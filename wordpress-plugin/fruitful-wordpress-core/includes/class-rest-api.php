@@ -32,7 +32,7 @@ class Fruitful_WP_Core_REST_API {
             [
                 'methods'             => WP_REST_Server::READABLE,
                 'callback'            => [$this, 'list_brands'],
-                'permission_callback' => [$this, 'can_edit_pages'],
+                'permission_callback' => [Fruitful_WP_Core_Permissions::class, 'can_read_brand_data'],
             ]
         );
 
@@ -42,7 +42,7 @@ class Fruitful_WP_Core_REST_API {
             [
                 'methods'             => WP_REST_Server::READABLE,
                 'callback'            => [$this, 'get_brand'],
-                'permission_callback' => [$this, 'can_edit_pages'],
+                'permission_callback' => [Fruitful_WP_Core_Permissions::class, 'can_read_brand_data'],
                 'args'                => [
                     'brand_id' => [
                         'sanitize_callback' => 'sanitize_key',
@@ -52,36 +52,46 @@ class Fruitful_WP_Core_REST_API {
         );
     }
 
-    public function can_edit_pages() {
-        return current_user_can('edit_pages');
-    }
-
     public function list_brands() {
         $client = new Fruitful_WP_Core_API_Client();
 
-        return rest_ensure_response(
-            Fruitful_WP_Core_Cache::remember(
-                'brands:editor',
-                10 * MINUTE_IN_SECONDS,
-                static function () use ($client) {
-                    return $client->get('/entities/Brand', ['limit' => 100]);
-                }
-            )
+        $raw = Fruitful_WP_Core_Cache::remember(
+            'brands:editor',
+            10 * MINUTE_IN_SECONDS,
+            static function () use ($client) {
+                return $client->get('/entities/Brand', ['limit' => 100]);
+            }
         );
+
+        if (is_wp_error($raw)) {
+            return $raw;
+        }
+
+        return rest_ensure_response(Fruitful_WP_Core_Schema_Validator::map_brand_list($raw));
     }
 
     public function get_brand(WP_REST_Request $request) {
         $brand_id = sanitize_key($request->get_param('brand_id'));
         $client   = new Fruitful_WP_Core_API_Client();
 
-        return rest_ensure_response(
-            Fruitful_WP_Core_Cache::remember(
-                'brand:' . $brand_id,
-                HOUR_IN_SECONDS,
-                static function () use ($client, $brand_id) {
-                    return $client->get('/entities/Brand/' . rawurlencode($brand_id));
-                }
-            )
+        $raw = Fruitful_WP_Core_Cache::remember(
+            'brand:' . $brand_id,
+            HOUR_IN_SECONDS,
+            static function () use ($client, $brand_id) {
+                return $client->get('/entities/Brand/' . rawurlencode($brand_id));
+            }
         );
+
+        if (is_wp_error($raw)) {
+            return $raw;
+        }
+
+        $brand = Fruitful_WP_Core_Schema_Validator::map_brand($raw);
+
+        if (is_wp_error($brand)) {
+            return $brand;
+        }
+
+        return rest_ensure_response($brand);
     }
 }
