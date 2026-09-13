@@ -1,24 +1,29 @@
 # ──────────────────────────────────────────────────────────────────────────
 # Banimal Connector — CI/CD Deployment Pipeline
 #
-# Triggers on pushes to the `development` branch. Runs lint + unit tests,
+# Triggers on pushes to the `development` branch only. Runs lint + unit tests,
 # builds and packages the production artifact, deploys to Cloudflare Workers
-# (staging), and reports status to GitHub Actions logs + an optional Slack
-# webhook.
+# (staging) with runtime secret injection, and reports status to GitHub
+# Actions logs + an optional Slack webhook.
 #
-# Required GitHub Secrets (configure under Settings → Secrets and Variables):
+# ── Required GitHub Secrets (Settings → Secrets and Variables → Actions) ──
 #   CLOUDFLARE_API_TOKEN        Cloudflare API token for Workers deployment
 #   CLOUDFLARE_ACCOUNT_ID       Cloudflare account ID
 #   WP_BRIDGE_SECRET            HMAC-SHA256 shared secret (WordPress ↔ Worker)
-#   PAYSTACK_SECRET_KEY         Paystack test/secret key
+#   PAYSTACK_SECRET_KEY         Paystack secret key
 #   PAYSTACK_LIVE_SECRET_KEY    Paystack live secret key
 #   BOBGO_API_KEY               BobGo shipping API key
 #   AUTH_SESSION_SECRET         Session authentication secret
 #   SITE_URL                    Production site URL
 #
-# Optional GitHub Secret:
+# ── Optional GitHub Secret ──
 #   SLACK_WEBHOOK_URL           Incoming webhook URL for Slack notifications
 #                               (if unset, the Slack step is skipped silently)
+#
+# ── GitHub Environment ──
+#   The deploy job uses a `development` environment. Create this under
+#   Settings → Environments and optionally require reviewers or restrict
+#   to specific branches for added security.
 # ──────────────────────────────────────────────────────────────────────────
 
 name: Banimal Connector CI/CD
@@ -27,12 +32,6 @@ on:
   push:
     branches:
       - development
-  workflow_dispatch:
-    inputs:
-      skip_deploy:
-        description: 'Skip the Cloudflare Workers deployment step'
-        type: boolean
-        default: false
 
 # Cancel superseded runs on the same branch to save CI minutes
 concurrency:
@@ -108,9 +107,9 @@ jobs:
         name: Build production artifact
         run: npm run build
         env:
-          # ── Production credentials injected from GitHub Secrets ──
-          # These are available at build time for environment-specific
-          # configuration (e.g. Vite env vars prefixed with VITE_).
+          # ── Build-time credentials injected from GitHub Secrets ──
+          # Vite reads VITE_-prefixed env vars at build time and inlines
+          # them into the client bundle.
           NODE_ENV: production
           VITE_SITE_URL: ${{ secrets.SITE_URL }}
 
@@ -121,12 +120,20 @@ jobs:
 
           mkdir -p deployment-package
 
-          # Built assets (Vite output)
+          # Built assets (Vite output — the deployable front-end bundle)
           cp -r dist/ deployment-package/dist/
 
-          # Deployment manifests and lockfile
+          # Worker source (needed for Wrangler deployment)
+          if [ -d src/worker ]; then
+            cp -r src/worker/ deployment-package/src/worker/
+          fi
+
+          # Deployment manifests, configs, and lockfile
           cp package.json package-lock.json deployment-package/
           cp wrangler.json deployment-package/
+          [ -f vite.config.ts ] && cp vite.config.ts deployment-package/ || true
+          [ -f vite.config.js ] && cp vite.config.js deployment-package/ || true
+          [ -f tsconfig.json ] && cp tsconfig.json deployment-package/ || true
 
           # Database migrations (if present)
           if [ -d migrations ]; then
@@ -156,7 +163,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ !github.event.inputs.skip_deploy }}
     environment:
       name: development
     permissions:
@@ -193,9 +199,17 @@ jobs:
           set -euo pipefail
           mkdir -p extracted
           tar -xzf banimal-connector-*.tar.gz -C extracted
-          # Restore built assets into expected location
+          # Restore built assets into expected locations
           cp -r extracted/dist/* dist/ 2>/dev/null || true
+          cp -r extracted/src/worker/* src/worker/ 2>/dev/null || true
           echo "Artifact extracted successfully"
+
+      - id: validate
+        name: Validate deployment (Wrangler dry-run)
+        run: npx wrangler deploy --dry-run
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - id: deploy
         name: Deploy to Cloudflare Workers (staging)
@@ -204,10 +218,28 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy --minify
+
+      - id: inject-secrets
+        name: Inject runtime secrets into Worker
+        run: |
+          set -euo pipefail
+
+          # Each secret is piped via stdin to `wrangler secret put`,
+          # which sets it as an encrypted Worker runtime binding.
+          # Values come from GitHub env vars (not echoed in logs).
+          printf '%s' "$WP_BRIDGE_SECRET"       | npx wrangler secret put WP_BRIDGE_SECRET
+          printf '%s' "$PAYSTACK_SECRET_KEY"     | npx wrangler secret put PAYSTACK_SECRET_KEY
+          printf '%s' "$PAYSTACK_LIVE_SECRET_KEY" | npx wrangler secret put PAYSTACK_LIVE_SECRET_KEY
+          printf '%s' "$BOBGO_API_KEY"           | npx wrangler secret put BOBGO_API_KEY
+          printf '%s' "$AUTH_SESSION_SECRET"     | npx wrangler secret put AUTH_SESSION_SECRET
+          printf '%s' "$SITE_URL"               | npx wrangler secret put SITE_URL
+
+          echo "All runtime secrets injected successfully"
         env:
-          # ── Production credentials injected from GitHub Secrets ──
-          # These are available at deploy time for runtime configuration.
-          # Referenced by wrangler.json / wrangler secret bindings.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # ── Production credentials from GitHub Secrets ──
+          # Piped to wrangler secret put (never printed in logs)
           WP_BRIDGE_SECRET: ${{ secrets.WP_BRIDGE_SECRET }}
           PAYSTACK_SECRET_KEY: ${{ secrets.PAYSTACK_SECRET_KEY }}
           PAYSTACK_LIVE_SECRET_KEY: ${{ secrets.PAYSTACK_LIVE_SECRET_KEY }}
@@ -221,6 +253,10 @@ jobs:
     needs: [lint-test, build, deploy]
     if: always()
     runs-on: ubuntu-latest
+    env:
+      # Job-level env so the Slack step's `if` can check whether a
+      # webhook URL was configured without referencing secrets directly.
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
     steps:
       - id: generate-summary
         name: Generate pipeline status summary
@@ -250,15 +286,15 @@ jobs:
           echo "Detailed step-by-step logs are available in the [Actions tab](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})." >> "$GITHUB_STEP_SUMMARY"
 
       - id: slack-notify
-        name: Send Slack notification (optional)
-        if: always()
+        name: Send Slack notification
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
         uses: slackapi/slack-github-action@v2.0.0
         with:
           webhook-type: incoming-webhook
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           payload: |
             {
-              "text": "Banimal Connector CI/CD — ${{ (needs.lint-test.result == 'success' && needs.build.result == 'success' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')) && 'PASSED' || 'FAILED' }}",
+              "text": "Banimal Connector CI/CD — ${{ (needs.lint-test.result == 'success' && needs.build.result == 'success' && needs.deploy.result == 'success') && 'PASSED' || 'FAILED' }}",
               "blocks": [
                 {
                   "type": "header",
@@ -311,4 +347,3 @@ jobs:
                 }
               ]
             }
-        continue-on-error: true
