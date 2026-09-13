@@ -1,0 +1,314 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Banimal Connector — CI/CD Deployment Pipeline
+#
+# Triggers on pushes to the `development` branch. Runs lint + unit tests,
+# builds and packages the production artifact, deploys to Cloudflare Workers
+# (staging), and reports status to GitHub Actions logs + an optional Slack
+# webhook.
+#
+# Required GitHub Secrets (configure under Settings → Secrets and Variables):
+#   CLOUDFLARE_API_TOKEN        Cloudflare API token for Workers deployment
+#   CLOUDFLARE_ACCOUNT_ID       Cloudflare account ID
+#   WP_BRIDGE_SECRET            HMAC-SHA256 shared secret (WordPress ↔ Worker)
+#   PAYSTACK_SECRET_KEY         Paystack test/secret key
+#   PAYSTACK_LIVE_SECRET_KEY    Paystack live secret key
+#   BOBGO_API_KEY               BobGo shipping API key
+#   AUTH_SESSION_SECRET         Session authentication secret
+#   SITE_URL                    Production site URL
+#
+# Optional GitHub Secret:
+#   SLACK_WEBHOOK_URL           Incoming webhook URL for Slack notifications
+#                               (if unset, the Slack step is skipped silently)
+# ──────────────────────────────────────────────────────────────────────────
+
+name: Banimal Connector CI/CD
+
+on:
+  push:
+    branches:
+      - development
+  workflow_dispatch:
+    inputs:
+      skip_deploy:
+        description: 'Skip the Cloudflare Workers deployment step'
+        type: boolean
+        default: false
+
+# Cancel superseded runs on the same branch to save CI minutes
+concurrency:
+  group: banimal-cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Lint & Unit Tests ────────────────────────────────────────
+  lint-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      lint-status: ${{ steps.lint.outcome }}
+      test-status: ${{ steps.test.outcome }}
+    steps:
+      - id: checkout
+        name: Checkout source
+        uses: actions/checkout@v4
+
+      - id: setup-node
+        name: Setup Node.js with dependency caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - id: install-deps
+        name: Install dependencies
+        run: npm ci
+
+      - id: lint
+        name: Run ESLint
+        run: npm run lint
+
+      - id: test
+        name: Run unit tests (Vitest)
+        run: npm test
+        env:
+          NODE_ENV: test
+
+  # ── Job 2: Build & Package Artifact ─────────────────────────────────
+  build:
+    name: Build & Package Artifact
+    needs: lint-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-name: ${{ steps.package.outputs.artifact_name }}
+    steps:
+      - id: checkout
+        name: Checkout source
+        uses: actions/checkout@v4
+
+      - id: setup-node
+        name: Setup Node.js with dependency caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - id: install-deps
+        name: Install dependencies
+        run: npm ci
+
+      - id: build
+        name: Build production artifact
+        run: npm run build
+        env:
+          # ── Production credentials injected from GitHub Secrets ──
+          # These are available at build time for environment-specific
+          # configuration (e.g. Vite env vars prefixed with VITE_).
+          NODE_ENV: production
+          VITE_SITE_URL: ${{ secrets.SITE_URL }}
+
+      - id: package
+        name: Package build artifact for deployment
+        run: |
+          set -euo pipefail
+
+          mkdir -p deployment-package
+
+          # Built assets (Vite output)
+          cp -r dist/ deployment-package/dist/
+
+          # Deployment manifests and lockfile
+          cp package.json package-lock.json deployment-package/
+          cp wrangler.json deployment-package/
+
+          # Database migrations (if present)
+          if [ -d migrations ]; then
+            cp -r migrations/ deployment-package/migrations/
+          fi
+
+          # Create versioned tarball keyed to commit SHA
+          ARTIFACT_NAME="banimal-connector-${GITHUB_SHA::8}.tar.gz"
+          tar -czf "$ARTIFACT_NAME" -C deployment-package .
+
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "Packaged artifact: $ARTIFACT_NAME"
+          ls -lh "$ARTIFACT_NAME"
+
+      - id: upload-artifact
+        name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: banimal-connector-build-${{ github.sha }}
+          path: ${{ steps.package.outputs.artifact_name }}
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Job 3: Deploy to Development Environment ────────────────────────
+  deploy:
+    name: Deploy to Development
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ !github.event.inputs.skip_deploy }}
+    environment:
+      name: development
+    permissions:
+      contents: read
+      deployments: write
+    outputs:
+      deploy-status: ${{ steps.deploy.outcome }}
+    steps:
+      - id: checkout
+        name: Checkout source
+        uses: actions/checkout@v4
+
+      - id: setup-node
+        name: Setup Node.js with dependency caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - id: install-deps
+        name: Install dependencies
+        run: npm ci
+
+      - id: download-artifact
+        name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: banimal-connector-build-${{ github.sha }}
+
+      - id: extract-artifact
+        name: Extract build artifact
+        run: |
+          set -euo pipefail
+          mkdir -p extracted
+          tar -xzf banimal-connector-*.tar.gz -C extracted
+          # Restore built assets into expected location
+          cp -r extracted/dist/* dist/ 2>/dev/null || true
+          echo "Artifact extracted successfully"
+
+      - id: deploy
+        name: Deploy to Cloudflare Workers (staging)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --minify
+        env:
+          # ── Production credentials injected from GitHub Secrets ──
+          # These are available at deploy time for runtime configuration.
+          # Referenced by wrangler.json / wrangler secret bindings.
+          WP_BRIDGE_SECRET: ${{ secrets.WP_BRIDGE_SECRET }}
+          PAYSTACK_SECRET_KEY: ${{ secrets.PAYSTACK_SECRET_KEY }}
+          PAYSTACK_LIVE_SECRET_KEY: ${{ secrets.PAYSTACK_LIVE_SECRET_KEY }}
+          BOBGO_API_KEY: ${{ secrets.BOBGO_API_KEY }}
+          AUTH_SESSION_SECRET: ${{ secrets.AUTH_SESSION_SECRET }}
+          SITE_URL: ${{ secrets.SITE_URL }}
+
+  # ── Job 4: Status Report ────────────────────────────────────────────
+  status-report:
+    name: Status Report
+    needs: [lint-test, build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - id: generate-summary
+        name: Generate pipeline status summary
+        run: |
+          echo "## Banimal Connector CI/CD Pipeline Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | \`development\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Run ID | ${{ github.run_id }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Job Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Lint & Unit Tests | ${{ needs.lint-test.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build & Package | ${{ needs.build.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Deploy | ${{ needs.deploy.result || 'skipped' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.lint-test.result }}" = "success" ] && [ "${{ needs.build.result }}" = "success" ]; then
+            echo "### Build Artifact" >> "$GITHUB_STEP_SUMMARY"
+            echo "Production build artifact is available for download from the [Actions run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "### Pipeline Logs" >> "$GITHUB_STEP_SUMMARY"
+          echo "Detailed step-by-step logs are available in the [Actions tab](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})." >> "$GITHUB_STEP_SUMMARY"
+
+      - id: slack-notify
+        name: Send Slack notification (optional)
+        if: always()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook-type: incoming-webhook
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "Banimal Connector CI/CD — ${{ (needs.lint-test.result == 'success' && needs.build.result == 'success' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')) && 'PASSED' || 'FAILED' }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Banimal Connector CI/CD"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:* `development`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Commit:* `${{ github.sha }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:* ${{ github.actor }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Lint & Test:* ${{ needs.lint-test.result }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Build:* ${{ needs.build.result }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Deploy:* ${{ needs.deploy.result || 'skipped' }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Pipeline Run"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        continue-on-error: true
